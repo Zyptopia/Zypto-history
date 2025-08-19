@@ -1,99 +1,134 @@
-// ESM version — works with "type": "module" in package.json
-// Usage (via GH Actions): node scripts/backfill/backfillFromGeckoTerminal.js <tokenAddress> <pairAddress>
+// scripts/backfill/backfillFromGeckoTerminal.js
+// ESM version. Pulls daily OHLCV from GeckoTerminal (public tier) and
+// upserts into Firestore. Soft‑handles the 180‑day limit (HTTP 401) as success.
 
-import { initializeApp, cert } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import admin from "firebase-admin";
 
-const projectId = process.env.FIREBASE_PROJECT_ID;
-const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+// --- Env ---
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
+const CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
+const PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-if (!projectId || !clientEmail || !privateKey) {
-  console.error("[gt] missing Firebase envs");
+const GT_KEY = process.env.GECKOTERMINAL_API_KEY; // required
+const GT_NETWORK = process.env.GT_NETWORK || "eth"; // e.g. "eth", "bsc", "base"
+
+// CLI args (token not currently used for GT daily; we backfill by pair)
+const [,, tokenArg, pairArg] = process.argv; // token optional, pair required
+const PAIR = (pairArg || process.env.UNIV2_PAIR || "").toLowerCase();
+
+if (!PROJECT_ID || !CLIENT_EMAIL || !PRIVATE_KEY) {
+  console.error("[gt] missing FIREBASE_* envs");
+  process.exit(1);
+}
+if (!GT_KEY) {
+  console.error("[gt] missing GECKOTERMINAL_API_KEY env");
+  process.exit(1);
+}
+if (!PAIR) {
+  console.error("[gt] missing pair address (arg2 or UNIV2_PAIR)");
   process.exit(1);
 }
 
-initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
-const db = getFirestore();
+// --- Firebase Admin ---
+if (admin.apps.length === 0) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: PROJECT_ID,
+      clientEmail: CLIENT_EMAIL,
+      privateKey: PRIVATE_KEY,
+    }),
+  });
+}
+const db = admin.firestore();
 
-const token = (process.argv[2] || process.env.ZYPTO_ADDR || "").toLowerCase();
-const pair = (process.argv[3] || process.env.UNIV2_PAIR || "").toLowerCase();
-const network = (process.env.GT_NETWORK || "eth").toLowerCase();
-const apiKey = process.env.GECKOTERMINAL_API_KEY || ""; // optional, helps with rate limits
-
-if (!pair) {
-  console.error("[gt] missing pair address");
-  process.exit(1);
+// --- Helpers ---
+function ymd(tsMs) {
+  const d = new Date(tsMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
 }
 
-const GT_BASE = "https://api.geckoterminal.com/api/v2";
+async function fetchGT_Daily({ network, pair, limit = 365 }) {
+  // Public tier: up to ~180 days; we'll request 365 and accept partial
+  const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${pair}/ohlcv/day?limit=${limit}`;
+  const res = await fetch(url, {
+    headers: { "accept": "application/json", "x-api-key": GT_KEY },
+  });
 
-async function fetchPage(beforeTs) {
-  const u = new URL(`${GT_BASE}/networks/${network}/pools/${pair}/ohlcv/day`);
-  u.searchParams.set("aggregate", "1");
-  u.searchParams.set("limit", "1000");
-  if (beforeTs) u.searchParams.set("before_timestamp", String(beforeTs));
+  if (res.status === 401) {
+    // Public tier hard‑limit hit; treat as soft success with empty/partial data
+    const txt = await res.text().catch(() => "");
+    console.warn("[gt] 401 soft‑limit:", txt.slice(0, 200));
+    return { candles: [], softLimited: true };
+  }
 
-  const headers = { Accept: "application/json" };
-  if (apiKey) headers["X-API-KEY"] = apiKey;
-
-  const res = await fetch(u, { headers });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`geckoterminal ${res.status}: ${text}`);
+    const txt = await res.text().catch(() => "");
+    throw new Error(`[geckoterminal ${res.status}] ${txt}`);
   }
+
   const json = await res.json();
+  // Shape: { data: { attributes: { ohlcv_list: [[ts, o,h,l,c,v], ...] }}}
   const list = json?.data?.attributes?.ohlcv_list || [];
-  return list;
+  const candles = list.map((row) => {
+    const [tsSec, o, h, l, c, v] = row;
+    return { ts: Number(tsSec) * 1000, o: +o, h: +h, l: +l, c: +c, v: +v };
+  }).filter(c => Number.isFinite(c.ts) && Number.isFinite(c.c));
+
+  return { candles, softLimited: false };
 }
 
-function isoDay(tsSec) {
-  return new Date(tsSec * 1000).toISOString().slice(0, 10);
-}
+async function upsertDaily(candles) {
+  if (!candles.length) return 0;
+  const batchSize = 450; // stay under 500 writes/batch
+  let written = 0;
 
-async function writeBatch(rows) {
-  const batch = db.batch();
-  for (const row of rows) {
-    const [ts, o, h, l, c, v] = row; // [unix, open, high, low, close, volume]
-    const day = isoDay(ts);
-    const ref = db.collection("zypto_prices_daily").doc(day);
-    batch.set(
-      ref,
-      {
-        geckoTerminal: { o, h, l, c, v, ts, pair, token, network },
-        _updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+  for (let i = 0; i < candles.length; i += batchSize) {
+    const slice = candles.slice(i, i + batchSize);
+    const batch = db.batch();
+    for (const k of slice) {
+      const docId = ymd(k.ts);
+      const ref = db.collection("zypto_prices_daily").doc(docId);
+      batch.set(ref, {
+        close: k.c,
+        high: k.h,
+        low: k.l,
+        open: k.o,
+        volumeUSD: k.v,
+        source_gt: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      written++;
+    }
+    await batch.commit();
   }
-  await batch.commit();
+  return written;
 }
 
-(async () => {
+(async function main() {
   try {
-    console.log("[uni-v2→gt] backfill start pair=", pair, "network=", network);
-    let before = Math.floor(Date.now() / 1000);
-    let total = 0;
+    console.log("[uni-v2→gt] backfill start pair=", PAIR, "network=", GT_NETWORK);
 
-    while (true) {
-      const rows = await fetchPage(before);
-      if (!rows.length) break;
-      await writeBatch(rows);
-      total += rows.length;
+    const { candles, softLimited } = await fetchGT_Daily({ network: GT_NETWORK, pair: PAIR, limit: 365 });
 
-      const lastTs = rows[rows.length - 1][0];
-      console.log(
-        `[gt] wrote ${rows.length} rows (total ${total}) — up to ${isoDay(lastTs)}`
-      );
-
-      before = lastTs - 1; // page backwards
-      if (total >= 20000) break; // safety cap
-      await new Promise((r) => setTimeout(r, 250)); // be polite
+    if (candles.length) {
+      // Oldest first so last write is the newest (useful for client caches)
+      candles.sort((a, b) => a.ts - b.ts);
+      const wrote = await upsertDaily(candles);
+      console.log(`[gt] wrote ${wrote} rows (total ${candles.length}) — up to ${ymd(candles.at(-1).ts)}`);
+    } else {
+      console.log("[gt] no candles returned (likely limit)");
     }
 
-    console.log(`[gt] done. total rows: ${total}`);
+    if (softLimited) {
+      console.log("[gt] reached public‑tier window; treating as success");
+    }
+
+    process.exit(0);
   } catch (e) {
-    console.error("[gt] ERROR", e?.message || e);
+    console.error("[gt] ERROR", String(e?.message || e));
     process.exit(1);
   }
 })();
