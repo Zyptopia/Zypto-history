@@ -1,0 +1,34 @@
+name: Zypto Ingest (Hourly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2 * * * *'  # run ~ at minute 2 each hour
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps (firebase-admin only)
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm install firebase-admin@^12 --silent
+
+      - name: Run ingestor
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+          FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+          ZYPTO_ADDR: 0x7a65cb87f596caf31a4932f074c59c0592be77d7
+          ZYPTO_UNI_PAIR: 0x1ecb460a532c1d76937bedbadf7d333da30255a4
+        run: node scripts/ingestors/zyptoIngestHourly.js
