@@ -5,6 +5,19 @@
 
 const admin = require('firebase-admin');
 
+import admin from 'firebase-admin';
+
+export function init() {
+  if (!admin.apps.length) {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+    admin.initializeApp({
+      credential: admin.credential.cert({ projectId, clientEmail, privateKey })
+    });
+  }
+  return { admin, db: admin.firestore() };
+}
 let app;
 
 function getCreds() {
