@@ -29,6 +29,8 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
-          ZYPTO_ADDR: 0x7a65cb87f596caf31a4932f074c59c0592be77d7
-          ZYPTO_UNI_PAIR: 0x1ecb460a532c1d76937bedbadf7d333da30255a4
+          # IMPORTANT: quote hex values so YAML treats them as strings, not integers
+          ZYPTO_ADDR: "0x7a65cb87f596caf31a4932f074c59c0592be77d7"
+          ZYPTO_UNI_PAIR: "0x1ecb460a532c1d76937bedbadf7d333da30255a4"
         run: node scripts/ingestors/zyptoIngestHourly.js
+
