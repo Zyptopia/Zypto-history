@@ -1,0 +1,38 @@
+name: ZYPTO Backfill (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      token_address:
+        description: "ERC-20 contract address (lowercase)"
+        required: true
+        default: "0x7a65cb87f596caf31a4932f074c59c0592be77d7"
+      chain:
+        description: "Chain slug for CoinGecko"
+        required: true
+        default: "ethereum"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Backfill daily prices from CoinGecko
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+          FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          ZYPTO_ADDR: ${{ github.event.inputs.token_address }}
+          ZYPTO_CHAIN: ${{ github.event.inputs.chain }}
+        run: node scripts/backfill/backfillFromCoinGecko.js
