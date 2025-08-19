@@ -1,122 +1,118 @@
 // scripts/backfill/backfillFromCoinGecko.js
-// Fetch full-price history from CoinGecko and store missing daily docs in Firestore
-// Works with both Demo and Pro keys. Set env COINGECKO_IS_PRO="true" for Pro, otherwise Demo.
+// Backfills daily prices into Firestore from CoinGecko.
+// - Works with DEMO key (free): falls back to last 365 days
+// - Will use PRO endpoint if you later set COINGECKO_TIER=pro
+//
+// Required ENV (set as GitHub repo secrets when run in Actions):
+//   FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+//   ZYPTO_ADDR (token address, lowercase)
+//   COINGECKO_API_KEY (your demo/pro key)
+// Optional:
+//   CHAIN (default 'ethereum')
+//   COINGECKO_TIER ('demo' | 'pro')
 
-import admin from "firebase-admin";
+import admin from 'firebase-admin';
 
-// --- Env ---
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
-const CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
-const PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+// ---- Firebase Admin init (service account from env) ----
+const projectId = process.env.FIREBASE_PROJECT_ID;
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+let privateKey = process.env.FIREBASE_PRIVATE_KEY || '';
+if (privateKey?.includes('\\n')) privateKey = privateKey.replace(/\\n/g, '\n');
 
-const ADDR = (process.env.ZYPTO_ADDR || "").toLowerCase();
-const CHAIN = process.env.ZYPTO_CHAIN || "ethereum";
-
-const CG_KEY = process.env.COINGECKO_API_KEY || "";
-const CG_IS_PRO = (process.env.COINGECKO_IS_PRO || "false").toLowerCase() === "true";
-const CG_BASE = process.env.COINGECKO_BASE || (CG_IS_PRO
-  ? "https://pro-api.coingecko.com"
-  : "https://api.coingecko.com");
-
-if (!PROJECT_ID || !CLIENT_EMAIL || !PRIVATE_KEY) {
-  console.error("[backfill] Missing Firebase credentials env (FIREBASE_*)");
-  process.exit(1);
-}
-if (!ADDR) {
-  console.error("[backfill] Missing ZYPTO_ADDR env");
-  process.exit(1);
-}
-
-// --- Firebase Admin ---
 if (!admin.apps.length) {
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: PROJECT_ID,
-      clientEmail: CLIENT_EMAIL,
-      privateKey: PRIVATE_KEY,
-    }),
+    credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
   });
 }
 const db = admin.firestore();
 
-// --- Helpers ---
-const toDateKey = (ms) => new Date(ms).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+// ---- Config ----
+const ZYPTO_ADDR = (process.env.ZYPTO_ADDR || '').toLowerCase();
+const CHAIN = process.env.CHAIN || 'ethereum';
+const CG_KEY = process.env.COINGECKO_API_KEY || '';
+const CG_TIER = (process.env.COINGECKO_TIER || 'demo').toLowerCase(); // 'demo' or 'pro'
 
-async function getCGPricesDaysMax({ chain, addr }) {
-  const url = `${CG_BASE}/api/v3/coins/${encodeURIComponent(chain)}/contract/${addr}/market_chart?vs_currency=usd&days=max&precision=6&interval=daily`;
-  const headers = {};
-  if (CG_KEY) {
-    // CoinGecko requires different header names for Demo vs Pro
-    headers[CG_IS_PRO ? "x-cg-pro-api-key" : "x-cg-demo-api-key"] = CG_KEY;
-  }
-  const res = await fetch(url, { headers });
+const CG_BASE = CG_TIER === 'pro' ? 'https://pro-api.coingecko.com' : 'https://api.coingecko.com';
+const CG_HEADER_NAME = CG_TIER === 'pro' ? 'x-cg-pro-api-key' : 'x-cg-demo-api-key';
+
+function dayKeyUTC(tsMs) {
+  return new Date(tsMs).toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+async function fetchCG(contract, { days = 'max' } = {}) {
+  const url = `${CG_BASE}/api/v3/coins/${CHAIN}/contract/${contract}/market_chart?vs_currency=usd&days=${days}&precision=6&interval=daily`;
+  const res = await fetch(url, { headers: CG_KEY ? { [CG_HEADER_NAME]: CG_KEY } : undefined });
+  const text = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    console.error("[backfill] ERROR coingecko", res.status + ":", text);
-    throw new Error("coingecko " + res.status);
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    const msg = typeof body === 'string' ? body : JSON.stringify(body);
+    throw new Error(`coingecko ${res.status}: ${msg}`);
   }
-  const json = await res.json();
-  // Expect arrays: prices[[ts, price]...], total_volumes[[ts, vol]...]
-  const prices = Array.isArray(json?.prices) ? json.prices : [];
-  const vols = Array.isArray(json?.total_volumes) ? json.total_volumes : [];
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`coingecko parse error: ${String(e?.message || e)}`);
+  }
+}
 
-  // Build map by date (UTC)
-  const byDate = new Map();
-  for (const [ts, price] of prices) {
-    const k = toDateKey(ts);
-    const exist = byDate.get(k) || {};
-    exist.priceUSD = Number(price);
-    byDate.set(k, exist);
+async function getCGPricesDaysMax(contract) {
+  try {
+    // First try full history
+    return await fetchCG(contract, { days: 'max' });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // Demo key historical limit -> auto-fallback to 365 days
+    if (/past 365 days/i.test(msg) || /10012/.test(msg) || /401/.test(msg)) {
+      console.log('[backfill] falling back to 365 days (demo key limit)');
+      return await fetchCG(contract, { days: '365' });
+    }
+    throw e;
   }
-  for (const [ts, vol] of vols) {
-    const k = toDateKey(ts);
-    const exist = byDate.get(k) || {};
-    exist.volumeUSD = Number(vol);
-    byDate.set(k, exist);
-  }
-  return byDate; // Map<YYYY-MM-DD, {priceUSD, volumeUSD?}>
 }
 
 async function backfillDaily() {
-  console.log(`[backfill] start for ${ADDR} on ${CHAIN}`);
-  const byDate = await getCGPricesDaysMax({ chain: CHAIN, addr: ADDR });
+  if (!ZYPTO_ADDR) throw new Error('ZYPTO_ADDR missing');
+  console.log(`[backfill] start for ${ZYPTO_ADDR} on ${CHAIN}`);
 
-  // Fetch existing docs (keys) to avoid rewriting
-  const snap = await db.collection("zypto_prices_daily").get();
-  const have = new Set();
-  snap.forEach((d) => have.add(d.id));
+  const data = await getCGPricesDaysMax(ZYPTO_ADDR);
+  const prices = Array.isArray(data?.prices) ? data.prices : [];
+  if (!prices.length) throw new Error('coingecko returned no prices');
 
-  let written = 0;
-  let batch = db.batch();
-  let ops = 0;
+  // Reduce to { YYYY-MM-DD: { ts, close } } using the *last* sample of the day as close
+  const byDay = new Map();
+  for (const [tsMs, price] of prices) {
+    const k = dayKeyUTC(tsMs);
+    const prev = byDay.get(k);
+    if (!prev || tsMs > prev.ts) byDay.set(k, { ts: tsMs, close: Number(price) });
+  }
 
-  for (const [k, v] of byDate.entries()) {
-    if (have.has(k)) continue; // skip existing day
-    const ref = db.collection("zypto_prices_daily").doc(k);
-    batch.set(ref, {
-      priceUSD: v.priceUSD,
-      volumeUSD: v.volumeUSD ?? null,
-      source: "coingecko",
-      ts: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-    ops++;
-    if (ops >= 450) { // keep well under 500 op limit
-      await batch.commit();
-      written += ops;
-      ops = 0;
-      batch = db.batch();
+  // Write to Firestore in small batches to avoid timeouts
+  const entries = Array.from(byDay.entries()).sort(([a], [b]) => a.localeCompare(b));
+  let wrote = 0;
+  while (entries.length) {
+    const chunk = entries.splice(0, 400);
+    const batch = db.batch();
+    for (const [day, { ts, close }] of chunk) {
+      if (!Number.isFinite(close)) continue;
+      const ref = db.collection('zypto_prices_daily').doc(day);
+      batch.set(ref, {
+        day,
+        priceUSD: close,
+        source: 'coingecko',
+        chain: CHAIN,
+        contract: ZYPTO_ADDR,
+        ts,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
     }
-  }
-
-  if (ops > 0) {
     await batch.commit();
-    written += ops;
+    wrote += chunk.length;
   }
 
-  console.log(`[backfill] done. wrote ${written} new days (existing skipped: ${have.size})`);
+  console.log(`[backfill] wrote days: ${wrote}`);
 }
 
-backfillDaily().catch((e) => {
-  console.error(e);
+backfillDaily().catch((err) => {
+  console.error('[backfill] ERROR', String(err?.message || err));
   process.exit(1);
 });
