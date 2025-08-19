@@ -1,0 +1,27 @@
+name: backfill-uniswap-v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      token:
+        description: "ERC-20 token address (lowercase)"
+        required: true
+        default: "0x7a65cb87f596caf31a4932f074c59c0592be77d7"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - name: Run Uniswap v3 backfill
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+          FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+          THEGRAPH_API_KEY: ${{ secrets.THEGRAPH_API_KEY }}
+          UNIV3_SUBGRAPH_ID: ${{ secrets.UNIV3_SUBGRAPH_ID }}
+        run: node scripts/backfill/backfillFromUniswapV3.js ${{ inputs.token }}
