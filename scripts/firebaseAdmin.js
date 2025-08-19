@@ -1,62 +1,54 @@
-// ===============================
-// File: scripts/firebaseAdmin.js
-// Purpose: Initialize Firebase Admin from either (A) env secrets (GitHub) or (B) local JSON (your new file).
-// ===============================
-
-const admin = require('firebase-admin');
+// =============================
+// File: scripts/firebaseAdmin.js (ESM)
+// Purpose: Initialize Firebase Admin SDK from ENV (GitHub Actions) OR from a
+//          local service-account JSON (dev). Includes the "newline fix" when
+//          using env vars so multi-line PEM keys work.
+// =============================
 
 import admin from 'firebase-admin';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-export function init() {
-  if (!admin.apps.length) {
-    const projectId = process.env.FIREBASE_PROJECT_ID;
+let inited = false;
+
+function loadLocalServiceAccount() {
+  try {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const localPath = path.join(__dirname, 'secrets', 'serviceAccount.json');
+    const json = fs.readFileSync(localPath, 'utf8');
+    return JSON.parse(json);
+  } catch (e) {
+    throw new Error(`serviceAccount.json missing or unreadable at scripts/secrets/. ${e?.message || e}`);
+  }
+}
+
+export function initAdmin() {
+  if (!inited && !admin.apps.length) {
+    const pid = process.env.FIREBASE_PROJECT_ID;
     const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-    const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-    admin.initializeApp({
-      credential: admin.credential.cert({ projectId, clientEmail, privateKey })
-    });
-  }
-  return { admin, db: admin.firestore() };
-}
-let app;
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY;
 
-function getCreds() {
-  // Prefer environment vars (GitHub Actions). Fall back to local JSON for dev.
-  const pid = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const pk = process.env.FIREBASE_PRIVATE_KEY;
-
-  if (pid && clientEmail && pk) {
-    return {
-      projectId: pid,
-      clientEmail,
-      // IMPORTANT: when the key is stored in a GitHub secret, newlines are often \n. Fix them.
-      privateKey: pk.replace(/\\n/g, '\n'),
-    };
-  }
-
-  // Local development: use the file you just placed at scripts/secrets/serviceAccount.json
-  // (Make sure scripts/secrets/ is in .gitignore)
-  // eslint-disable-next-line import/no-dynamic-require, global-require
-  const local = require('./secrets/serviceAccount.json');
-  return {
-    projectId: local.project_id,
-    clientEmail: local.client_email,
-    privateKey: local.private_key,
-  };
-}
-
-function init() {
-  if (!admin.apps.length) {
-    const creds = getCreds();
-    app = admin.initializeApp({
-      credential: admin.credential.cert(creds),
-    });
-  } else {
-    app = admin.app();
+    if (pid && clientEmail && privateKey) {
+      // GitHub/ENV secrets often contain literal "\\n" sequences. Convert to real newlines.
+      if (privateKey.includes('\\n')) privateKey = privateKey.replace(/\\n/g, '\n');
+      admin.initializeApp({
+        credential: admin.credential.cert({ projectId: pid, clientEmail, privateKey }),
+      });
+    } else {
+      // Local dev fallback (./scripts/secrets/serviceAccount.json)
+      const serviceAccount = loadLocalServiceAccount();
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
+    inited = true;
   }
   const db = admin.firestore();
-  return { admin, app, db };
+  return { admin, db };
 }
 
-module.exports = { init };
+// Optional alias so existing code importing { init } still works
+export { initAdmin as init };
+export default initAdmin;
