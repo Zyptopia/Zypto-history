@@ -1,0 +1,33 @@
+name: Backfill daily from CoinGecko → Firestore
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Run backfill
+        run: node scripts/backfill/backfillFromCoinGecko.js
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
+          FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+
+          # Token + chain
+          ZYPTO_ADDR: "0x7a65cb87f596caf31a4932f074c59c0592be77d7" # QUOTED! prevents YAML parsing as int
+          ZYPTO_CHAIN: "ethereum"
+
+          # CoinGecko Demo key
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_IS_PRO: "false" # change to "true" if you later upgrade to Pro
