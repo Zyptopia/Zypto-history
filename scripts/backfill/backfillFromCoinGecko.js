@@ -25,6 +25,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function cgBase() {
