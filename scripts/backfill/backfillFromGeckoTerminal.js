@@ -1,137 +1,99 @@
-// scripts/backfill/backfillFromGeckoTerminal.js
-// Backfill daily OHLCV using GeckoTerminal Onchain API (CoinGecko).
-// - Works by paging backwards with `before_timestamp` until no more data.
-// - Writes NON-DESTRUCTIVE fields under `geckoTerminal` in `zypto_prices_daily/{YYYY-MM-DD}`.
-//
-// Env needed (GitHub Actions → Repo secrets):
-//   FIREBASE_PROJECT_ID
-//   FIREBASE_CLIENT_EMAIL
-//   FIREBASE_PRIVATE_KEY   (use the multiline value, with \n preserved)
-// Optional:
-//   GECKOTERMINAL_API_KEY  (you can reuse your CoinGecko key; if missing, it will try without)
-//
-// Usage (local):
-//   node scripts/backfill/backfillFromGeckoTerminal.js 0xPAIRADDRESS
-// Usage (GH Actions): see .github/workflows/backfill-geckoterminal.yml
+// ESM version — works with "type": "module" in package.json
+// Usage (via GH Actions): node scripts/backfill/backfillFromGeckoTerminal.js <tokenAddress> <pairAddress>
 
-const admin = require("firebase-admin");
+import { initializeApp, cert } from "firebase-admin/app";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
-const TOKEN_ADDR = (process.argv[2] || process.env.ZYPTO_ADDR || "0x7a65cb87f596caf31a4932f074c59c0592be77d7").toLowerCase();
-const PAIR_ADDR = (process.argv[3] || process.env.UNIV2_PAIR || "0x1ecb460a532c1d76937bedbadf7d333da30255a4").toLowerCase();
-const NETWORK_SLUG = process.env.GT_NETWORK || "eth"; // Ethereum mainnet on GeckoTerminal is usually "eth"
+const projectId = process.env.FIREBASE_PROJECT_ID;
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-function initFirebase() {
-  if (admin.apps.length) return admin.app();
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  let privateKey = process.env.FIREBASE_PRIVATE_KEY;
-  if (!projectId || !clientEmail || !privateKey) {
-    throw new Error("Missing FIREBASE_* envs");
-  }
-  // Fix escaped newlines if needed
-  if (privateKey.includes("\\n")) privateKey = privateKey.replace(/\\n/g, "\n");
-
-  admin.initializeApp({
-    credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
-  });
-  return admin.app();
+if (!projectId || !clientEmail || !privateKey) {
+  console.error("[gt] missing Firebase envs");
+  process.exit(1);
 }
 
-function ymdFromUnix(tsSec) {
-  const d = new Date(tsSec * 1000);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
+const db = getFirestore();
+
+const token = (process.argv[2] || process.env.ZYPTO_ADDR || "").toLowerCase();
+const pair = (process.argv[3] || process.env.UNIV2_PAIR || "").toLowerCase();
+const network = (process.env.GT_NETWORK || "eth").toLowerCase();
+const apiKey = process.env.GECKOTERMINAL_API_KEY || ""; // optional, helps with rate limits
+
+if (!pair) {
+  console.error("[gt] missing pair address");
+  process.exit(1);
 }
 
-async function fetchCandlesDay(pair, beforeTs) {
-  const params = new URLSearchParams({ aggregate: "1", limit: "1000" });
-  if (beforeTs) params.set("before_timestamp", String(beforeTs));
-  const url = `https://api.geckoterminal.com/api/v2/networks/${NETWORK_SLUG}/pools/${pair}/ohlcv/day?${params.toString()}`;
+const GT_BASE = "https://api.geckoterminal.com/api/v2";
+
+async function fetchPage(beforeTs) {
+  const u = new URL(`${GT_BASE}/networks/${network}/pools/${pair}/ohlcv/day`);
+  u.searchParams.set("aggregate", "1");
+  u.searchParams.set("limit", "1000");
+  if (beforeTs) u.searchParams.set("before_timestamp", String(beforeTs));
 
   const headers = { Accept: "application/json" };
-  const k = process.env.GECKOTERMINAL_API_KEY;
-  if (k) headers["x-api-key"] = k;
+  if (apiKey) headers["X-API-KEY"] = apiKey;
 
-  const res = await fetch(url, { headers });
+  const res = await fetch(u, { headers });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`geckoterminal ${res.status}: ${text.slice(0, 200)}`);
+    const text = await res.text();
+    throw new Error(`geckoterminal ${res.status}: ${text}`);
   }
   const json = await res.json();
-
-  // Shape: data.attributes.ohlcv_list is commonly [[ts, o, h, l, c, v], ...]
-  const attrs = json && json.data && json.data.attributes;
-  const raw = (attrs && (attrs.ohlcv_list || attrs.ohlcv || attrs.candles)) || [];
-
-  const rows = raw.map((row) => {
-    if (Array.isArray(row)) {
-      const [ts, o, h, l, c, v] = row;
-      return { ts: Number(ts), o: Number(o), h: Number(h), l: Number(l), c: Number(c), v: Number(v || 0) };
-    }
-    // object-style safety
-    return {
-      ts: Number(row.timestamp || row.t || 0),
-      o: Number(row.open || row.o),
-      h: Number(row.high || row.h),
-      l: Number(row.low || row.l),
-      c: Number(row.close || row.c),
-      v: Number(row.volume || row.v || 0),
-    };
-  }).filter(r => r.ts && isFinite(r.c));
-
-  return rows;
+  const list = json?.data?.attributes?.ohlcv_list || [];
+  return list;
 }
 
-async function backfillDaily() {
-  console.log("[gt] backfill start pair=", PAIR_ADDR, "network=", NETWORK_SLUG);
-  initFirebase();
-  const db = admin.firestore();
+function isoDay(tsSec) {
+  return new Date(tsSec * 1000).toISOString().slice(0, 10);
+}
 
-  let before = Math.floor(Date.now() / 1000);
-  let total = 0;
-
-  while (true) {
-    const batch = await fetchCandlesDay(PAIR_ADDR, before);
-    if (!batch.length) break;
-
-    // Next page: set before to (oldest ts - 1)
-    const oldest = batch[batch.length - 1].ts;
-    before = oldest - 1;
-
-    const writes = batch.map((row) => {
-      const ymd = ymdFromUnix(row.ts);
-      const ref = db.collection("zypto_prices_daily").doc(ymd);
-      return ref.set({
-        geckoTerminal: {
-          pair: PAIR_ADDR,
-          token: TOKEN_ADDR,
-          o: row.o,
-          h: row.h,
-          l: row.l,
-          c: row.c,
-          v: row.v,
-          ts: row.ts,
-          network: NETWORK_SLUG,
-        },
-        // do not overwrite your canonical price if you have one already
-        _updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
-
-    await Promise.all(writes);
-    total += batch.length;
-    console.log(`[gt] wrote ${batch.length} rows (total ${total}) — up to ${ymdFromUnix(before+1)}`);
-
-    // Small polite delay to avoid any rate limiting
-    await new Promise(r => setTimeout(r, 500));
+async function writeBatch(rows) {
+  const batch = db.batch();
+  for (const row of rows) {
+    const [ts, o, h, l, c, v] = row; // [unix, open, high, low, close, volume]
+    const day = isoDay(ts);
+    const ref = db.collection("zypto_prices_daily").doc(day);
+    batch.set(
+      ref,
+      {
+        geckoTerminal: { o, h, l, c, v, ts, pair, token, network },
+        _updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
   }
-
-  console.log(`[gt] done. total rows: ${total}`);
+  await batch.commit();
 }
 
-backfillDaily().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+(async () => {
+  try {
+    console.log("[uni-v2→gt] backfill start pair=", pair, "network=", network);
+    let before = Math.floor(Date.now() / 1000);
+    let total = 0;
+
+    while (true) {
+      const rows = await fetchPage(before);
+      if (!rows.length) break;
+      await writeBatch(rows);
+      total += rows.length;
+
+      const lastTs = rows[rows.length - 1][0];
+      console.log(
+        `[gt] wrote ${rows.length} rows (total ${total}) — up to ${isoDay(lastTs)}`
+      );
+
+      before = lastTs - 1; // page backwards
+      if (total >= 20000) break; // safety cap
+      await new Promise((r) => setTimeout(r, 250)); // be polite
+    }
+
+    console.log(`[gt] done. total rows: ${total}`);
+  } catch (e) {
+    console.error("[gt] ERROR", e?.message || e);
+    process.exit(1);
+  }
+})();
