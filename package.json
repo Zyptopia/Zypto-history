@@ -1,9 +1,13 @@
 {
   "name": "zypto-history",
   "version": "1.0.0",
+  "description": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "backfill:cg": "node scripts/backfill/backfillFromCoinGecko.js",
+    "ingest:hourly": "node scripts/ingestors/zyptoIngestHourly.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
   "repository": {
     "type": "git",
@@ -16,8 +20,10 @@
     "url": "https://github.com/Zyptopia/Zypto-history/issues"
   },
   "homepage": "https://github.com/Zyptopia/Zypto-history#readme",
-  "description": "",
   "dependencies": {
     "firebase-admin": "^12.7.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
